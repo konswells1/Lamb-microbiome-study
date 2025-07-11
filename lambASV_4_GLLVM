@@ -1,0 +1,354 @@
+##################
+# GLLVM for ASV composition analysis
+
+
+###########
+# GLLVM with predictors for genus-level data
+
+# Matrix of genus-level data
+genus_mat <- as.matrix(D_genus[, -1])
+rownames(genus_mat) <- D_genus$Genus
+
+select_GenusCommon <- rowSums(ifelse(genus_mat>0,1,0))>trshld_preval & rowSums(genus_mat)>trshld_reads
+mat_GenusCommon <- genus_mat[select_GenusCommon,] 
+
+Y_genus <- t(mat_GenusCommon)
+
+# starting values for gllvm
+starts_list_G <- list(coefX = matrix(0.00001, ncol = ncol(X_pred), nrow = ncol(Y_genus)))
+
+set.seed(123)
+fit_Xpred_genus <- gllvm(Y_genus, X = X_pred, studyDesign = sDesign, formula = ~ pasture + month + Nematodirus + Strongyle, 
+                         family = "negative.binomial", row.eff = "fixed",  method  = "EVA",  
+				 starts = starts_list_G, num.lv = 2)
+
+# coefplot(fit_Xpred_genus, cex.ylab = 0.5, y.label = FALSE)
+
+coef_Xpred_G <-coef(fit_Xpred_genus)
+coef_int_G <- data.frame(coef_Xpred_G$Intercept)
+coef_Xcoef_G <- data.frame(coef_Xpred_G$Xcoef) 
+coef_merg_G <- merge(coef_int_G, coef_Xcoef_G, by = 0)
+row.names(coef_merg_G) <- rownames(coef_Xcoef_G)  ##coef_merg_G$Row.names  
+coef_merg_G <- coef_merg_G[colnames(Y_genus),]
+names(coef_merg_G)[1] <- "Genus"
+names(coef_merg_G)[2]<- "Intercept"
+
+coef_long_G <- pivot_longer(coef_merg_G, names_to = "Treatment", values_to = "Estimate", cols = names(coef_merg_G)[-1])
+
+confint_Xcoef_G <- data.frame(confint(fit_Xpred_genus, parm = "Xcoef", level = 0.95))
+
+# add a column with correct variable level
+coefX_names_G <- colnames(coef_merg_G)[-c(1,2)]
+#variables <- c(variables, "Intercept")
+coefX_names_X_G <- rep(coefX_names_G , nrow(coef_int_G))
+coefX_names_X_G <- coefX_names_X_G[order(match(coefX_names_X_G, coefX_names_G))]
+
+confint_Xcoef_G$Treatment <- coefX_names_X_G
+
+# column with taxa names (should be in the correct order but double check)
+confint_Xcoef_G$Genus <- rep(colnames(Y_genus), length(unique(confint_Xcoef_G$Treatment)))
+
+estimates_G <- left_join(coef_long_G, confint_Xcoef_G, by = c("Treatment", "Genus"))
+
+## add indicator of significance
+estimates_G$significant<- !data.table::between(0, estimates_G$cilow, estimates_G$ciup)
+head(estimates_G)
+
+# Taxonomy names for revised families
+taxNames_G <- as_tibble(tax.clean[,c("Genus_rev", "Family_rev", "Phylum_rev")])
+taxNames_G <- rename(taxNames_G, Genus = Genus_rev, Family = "Family_rev", Phylum = Phylum_rev)
+taxNames_G <- taxNames_G %>% distinct(Genus, .keep_all = TRUE)
+
+estimates_G <- left_join(estimates_G, taxNames_G, by="Genus", relationship = "many-to-many") # add in taxa names
+estimates_G <- estimates_G %>%  filter(Treatment!="Intercept")
+# Effect for alpha in plots
+estimates_G <- estimates_G %>% mutate(effect = ifelse(significant==TRUE, 1, 0.1)) 
+estimates_G$Treatment <- recode_factor(estimates_G$Treatment, "pastureMixed.sward"="Mixed sward", "monthJuly"="July", "monthSept"="Sept")
+estimates_G$Genus <- factor(estimates_G$Genus)
+
+treat.labs <- c("Mixed sward", "July", "Sept", "Nematodirus", "Strongyles")
+
+plot_gllvmEstimates_G <- 
+  estimates_G %>%
+   mutate(Phylum = fct_relevel(Phylum, "others", after = Inf)) %>%
+    #mutate(Treatment = fct_relevel(Treatment, c("Mixed sward", "July","Sept","Nematodirus","Strongyle"))) %>%
+  ggplot(aes(x=Genus, y=Estimate, fill = Phylum)) +
+  geom_hline(yintercept=0, linetype=2, color = "gray20") +
+  geom_errorbar(aes(ymin= cilow, ymax= ciup), width=0.01, linewidth=0.2, alpha = estimates_G$effect) + 
+  geom_point(shape=21, alpha = estimates_G$effect) +
+  coord_flip() +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  facet_grid(. ~ Treatment, labeller = labeller(Treatment = treat.labs)) +
+  ylab("Relative abundance shift (log-scale change)") +
+  xlab("Genus") +
+  scale_x_discrete(limits = rev(unique(estimates_G$Genus[order(estimates_G$Phylum)])), labels= element_blank()) +
+  scale_fill_manual("Phylum",values=col_phyl) +
+  theme_bw()+
+  theme(panel.grid.minor = element_blank()) +
+  theme(axis.text.x = element_text(size=7), axis.text.y = element_text(size=5),
+        legend.text = element_text(size=7), legend.title = element_text(size=7))
+plot_gllvmEstimates_G
+
+##  ggsave(file="plot_gllvmEstimates_Genus.tiff", plot_gllvmEstimates_G, units = "in", dpi=300, width = 2*3.35, height = 2*3.35/1.5)
+
+##  Save gLVVM estimates to data file
+##  write_csv(estimates_G, file= "estimates_GLVVM_GenusLevel.csv")
+
+
+#####
+# Summaries of effect to report at genus level:
+
+# number of genera in model
+n_genera_common <- length(unique(estimates_G$Genus)) -1
+n_genera_common
+
+effectGLLVM_any_G  <- estimates_G %>% filter(significant==TRUE) %>% filter(Genus!="others") %>%
+        mutate(direction = ifelse(Estimate >0, "positive", "negative"),
+               notable = ifelse(ciup< (-0.5)  | cilow>0.5, "notable", "small"))
+
+# Number of relationships tested (excluding "others")
+n_relationships_G <- nrow(estimates_G  %>% filter(Genus!="others"))
+n_relationships_G
+
+# Number and proportion of significant relationships
+nrow(effectGLLVM_any_G)
+nrow(effectGLLVM_any_G)/n_relationships_G
+
+summary_effectGLLVM_G_neffects_1 <- effectGLLVM_any_G %>%
+  count(Treatment, direction) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+print(summary_effectGLLVM_G_neffects_1)
+
+summary_effectGLLVM_G_neffects_2 <- effectGLLVM_any_G %>%
+  count(Treatment, direction, Genus) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+print(n= nrow(effectGLLVM_any_G), summary_effectGLLVM_G_neffects_2)
+
+
+summary_effectGLLVM_G_notable <- effectGLLVM_any_G %>% filter(notable=="notable") %>%
+  count(Treatment, direction) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+print(summary_effectGLLVM_G_notable )
+
+
+effect_notable_G <- effectGLLVM_any_G %>% filter(notable=="notable") %>%
+       mutate(mean_change = round(exp(Estimate), 2),
+              CI_low = round(exp(cilow), 2),
+              CI_up = round(exp(ciup), 2) )
+
+
+# Print table of significant estimates (as results for manuscript, Supporting table)
+table_effectGLLVM_any_G <- effectGLLVM_any_G %>%
+  mutate(Estimate_form = paste0(round(Estimate, 2), " (", round(cilow, 2), " - ", round(ciup, 2), ")")) %>%
+  dplyr::select(Treatment, Genus, Family, Phylum, Estimate_form)
+## write_csv(table_effectGLLVM_any_G, "table_effectGLLVM_any_G.csv")
+
+
+
+genus_effected_helminth <- unique((table_effectGLLVM_any_G %>% filter(Treatment == "Nematodirus" | Treatment == "Strongyle") %>% dplyr::select(Genus)))
+genus_effected_environment <- unique(table_effectGLLVM_any_G %>% filter(Treatment != "Nematodirus" & Treatment != "Strongyle") %>% dplyr::select(Genus)) 
+
+matches <- inner_join(genus_effected_helminth, genus_effected_environment, by = "Genus")
+
+###########
+# GLLVM with predictors for family-level data
+
+
+# Matrix of family-level data
+family_mat <- as.matrix(D_family[, -1])
+rownames(family_mat) <- D_family$Family
+
+select_FamilyCommon <- rowSums(ifelse(family_mat>0,1,0))>trshld_preval & rowSums(family_mat)>trshld_reads
+mat_FamilyCommon <- family_mat[select_FamilyCommon,] 
+
+Y_family <- t(mat_FamilyCommon)
+
+set.seed(123)
+fit_Xpred_family <- gllvm(Y_family, X = X_pred, studyDesign = sDesign, formula = ~ pasture + month + Nematodirus + Strongyle, 
+                          family = "negative.binomial", row.eff = "fixed",  method  = "EVA",  num.lv = 2)
+
+# coefplot(fit_Xpred_family, cex.ylab = 0.5, y.label = FALSE)
+
+coef_Xpred_F <-coef(fit_Xpred_family)
+coef_int_F <- data.frame(coef_Xpred_F$Intercept)
+coef_Xcoef_F <- data.frame(coef_Xpred_F$Xcoef) 
+coef_merg_F <- merge(coef_int_F, coef_Xcoef_F, by = 0)
+row.names(coef_merg_F) <- rownames(coef_Xcoef_F)  ##coef_merg_F$Row.names  
+coef_merg_F <- coef_merg_F[colnames(Y_family),]
+names(coef_merg_F)[1] <- "Family"
+names(coef_merg_F)[2]<- "Intercept"
+
+coef_long_F <- pivot_longer(coef_merg_F, names_to = "Treatment", values_to = "Estimate", cols = names(coef_merg_F)[-1])
+
+confint_Xcoef_F <- data.frame(confint(fit_Xpred_family, parm = "Xcoef", level = 0.95))
+
+# add a column with correct variable level
+coefX_names_F <- colnames(coef_merg_F)[-c(1,2)]
+#variables <- c(variables, "Intercept")
+coefX_names_X_F <- rep(coefX_names_F , nrow(coef_int_F))
+coefX_names_X_F <- coefX_names_X_F[order(match(coefX_names_X_F, coefX_names_F))]
+
+confint_Xcoef_F$Treatment <- coefX_names_X_F
+
+# column with taxa names (should be in the correct order but double check)
+confint_Xcoef_F$Family <- rep(colnames(Y_family), length(unique(confint_Xcoef_F$Treatment)))
+
+estimates_F <- left_join(coef_long_F, confint_Xcoef_F, by = c("Treatment", "Family"))
+
+## add indicator of significance
+estimates_F$significant<- !data.table::between(0, estimates_F$cilow, estimates_F$ciup)
+head(estimates_F)
+
+# Taxonomy names for revised families
+taxNames_F <- as_tibble(tax.clean[,c("Family_rev", "Phylum_rev")])
+taxNames_F <- rename(taxNames_F, Family = Family_rev)
+taxNames_F <- rename(taxNames_F, Phylum = Phylum_rev)
+taxNames_F <- taxNames_F %>% distinct(Family, .keep_all = TRUE)
+
+estimates_F <- left_join(estimates_F, taxNames_F, by="Family", relationship = "many-to-many") # add in taxa names
+estimates_F <- estimates_F %>%  filter(Treatment!="Intercept")
+# Effect for alpha in plots
+estimates_F <- estimates_F %>% mutate(effect = ifelse(significant==TRUE, 1, 0.1)) 
+estimates_F$Treatment <- recode_factor(estimates_F$Treatment, "pastureMixed.sward"="Mixed sward", "monthJuly"="July", "monthSept"="Sept")
+estimates_F$Family <- factor(estimates_F$Family)
+
+plot_gllvmEstimates_F <- 
+  estimates_F %>%
+   mutate(Phylum = fct_relevel(Phylum, "others", after = Inf)) %>%
+    #mutate(Treatment = fct_relevel(Treatment, c("Mixed sward", "July","Sept","Nematodirus","Strongyle"))) %>%
+  ggplot(aes(x=Family, y=Estimate, fill = Phylum)) +
+  geom_hline(yintercept=0, linetype=2, color = "gray20") +
+  geom_errorbar(aes(ymin= cilow, ymax= ciup), width=0.01, linewidth=0.2, alpha = estimates_F$effect) + 
+  geom_point(shape=21, alpha = estimates_F$effect) +
+  coord_flip() +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  facet_grid(. ~ Treatment, labeller = labeller(Treatment = treat.labs)) +
+  ylab("Relative abundance shift (log-scale change)") +
+  xlab("Family") +
+  scale_x_discrete(limits = rev(unique(estimates_F$Family[order(estimates_F$Phylum)])), labels= element_blank()) +
+  scale_fill_manual("Phylum",values=col_phyl) +
+  theme_bw()+
+  theme(panel.grid.minor = element_blank()) +
+  theme(axis.text.x = element_text(size=7), axis.text.y = element_text(size=5),
+        legend.text = element_text(size=7), legend.title = element_text(size=7))
+plot_gllvmEstimates_F
+
+##  ggsave(file="plot_gllvmEstimates_Family.tiff", plot_gllvmEstimates_F, units = "in", dpi=300, width = 2*3.35, height = 2*3.35/1.5)
+
+
+#####
+# Number of significant effect to report at family level:
+
+
+# number of families in model
+n_family_common <- length(unique(estimates_F$Family)) -1
+n_family_common
+
+effectGLLVM_any_F  <- estimates_F %>% filter(significant==TRUE) %>% filter(Family!="others") %>%
+        mutate(direction = ifelse(Estimate >0, "positive", "negative"),
+               notable = ifelse(ciup< (-0.5)  | cilow>0.5, "notable", "small"))
+
+# Number of relationships tested (exlcuding "others")
+n_relationships_F <- nrow(estimates_F  %>% filter(Family!="others"))
+n_relationships_F
+
+# Number and proportion of significant relationships
+nrow(effectGLLVM_any_F)
+nrow(effectGLLVM_any_F)/n_relationships_F
+
+summary_effectGLLVM_F_neffects_1 <- effectGLLVM_any_F %>%
+  count(Treatment, direction) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+print(summary_effectGLLVM_F_neffects_1)
+
+summary_effectGLLVM_F_neffects_2 <- effectGLLVM_any_F %>%
+  count(Treatment, direction, Family) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+print(n=55, summary_effectGLLVM_F_neffects_2)
+
+
+# Print table of significant estimates (as results for manuscript, Supporting Table)
+table_effectGLLVM_any_F <- effectGLLVM_any_F %>%
+  mutate(Estimate_form = paste0(round(Estimate, 2), " (", round(cilow, 2), " - ", round(ciup, 2), ")")) %>%
+  dplyr::select(Treatment, Family, Phylum, Estimate_form)
+write_csv(table_effectGLLVM_any_F, "table_effectGLLVM_any_F.csv")
+
+
+
+#############
+# Family-level GLLVM co-occurrence analysis
+
+# Get correlation matrix (residual correlation from LV null model)
+family_corr <- getResidualCor(fit_Xpred_family )  ###  family_corr <- getResidualCor(fit_Xpred_family)
+
+# Remove small values below threshold
+family_corr_2 <- family_corr
+family_corr_2[abs(family_corr_2)<0.6] <- 0 ### define threshold for correlations
+
+graph_corr_family <- network::network(family_corr_2, directed = FALSE, 
+                               vertex.attr = list(Family = rownames(family_corr_2)))
+
+plot_coocc_family <- ggnet2(graph_corr_family, node.size = 1.5, node.color = "Family", 
+                     edge.size = 0.3, edge.color = "grey70") +
+  guides(size = F)
+                   ##  alpha= "Family", alpha.legend = "Family", color.legend = "Family") + 
+  theme(panel.background = element_rect(color = "white"))
+plot_coocc_family 
+
+
+# Shorten Family names
+rownames(family_corr_2) <- gsub("aceae", "a.", rownames(family_corr_2))
+colnames(family_corr_2) <- gsub("aceae", "a.", colnames(family_corr_2))
+
+rownames(family_corr_2) <- paste0(substr(rownames(family_corr_2),1,6), ".")
+colnames(family_corr_2) <- paste0(substr(colnames(family_corr_2),1,6), ".")
+rownames(family_corr_2)[which(rownames(family_corr_2)=="others.")] <- "others"
+colnames(family_corr_2)[which(colnames(family_corr_2)=="others.")] <- "others"
+
+family_corr_2[which(rownames(family_corr_2)=="others"),] <- 0
+family_corr_2[, which(colnames(family_corr_2)=="others")] <- 0
+
+# Extract 'significant correlations
+
+corr_significant <- as_tibble(family_corr) 
+corr_significant$Family <- rownames(family_corr)
+corr_significant <- corr_significant %>% pivot_longer(!Family, names_to = "Family_2", values_to = "coef") %>%
+                      filter(coef>0.7) %>%
+                      filter(Family!=Family_2)  
+corr_significant
+
+unique(union(corr_significant$Family, corr_significant$Family_2))
+
+
+
+#Basic chord diagram but without labeling 
+
+####
+# Chord diagram
+
+library(circlize)
+
+
+chordDiagram(family_corr_2, annotationTrack = "grid", preAllocateTracks = 1)
+
+# Generate vector of distinct colors
+library(RColorBrewer)
+n <- length(unlist(dimnames(family_corr_2)))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+plot_cord_corr_family <-  function(){
+    #  grid.col <- setNames(rainbow(length(unlist(dimnames(family_corr_2)))), union(rownames(family_corr_2), colnames(family_corr_2)))
+    grid.col <- setNames(col_vector, union(rownames(family_corr_2), colnames(family_corr_2)))
+    par(mar = c(0, 0, 0, 0), mfrow = c(1, 1)) 
+    circos.par(circle.margin=c(0.7)) # Set margins to adjust for labels      
+    chordDiagram(family_corr_2, grid.col = grid.col, annotationTrack = "grid", preAllocateTracks = 1) 
+    ##  preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(family_corr_2))))))
+    # we go back to the first track and customize sector labels
+    circos.track(track.index = 1, panel.fun = function(x, y) {
+    circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, 
+        facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5), cex=0.6)
+    }, bg.border = NA) # here set bg.border to NA is important
+}
+circos.clear()         
+plot_cord_corr_family()
