@@ -1,0 +1,374 @@
+# Load libraries
+library(tidyverse)
+library(taxize)
+library(ggh4x)
+library(data.table)
+library(ggplot2)
+library(ggsci)
+library(ggpubr)
+library(phyloseq)
+library(scales)
+
+
+set.seed(123)
+
+
+# Load data
+D_asv <- read.table(file = "feature-table.tsv", sep = "\t", header = TRUE, row.names = 1, skip = 1, comment.char = "")
+# Transform to tibble
+D_asv <- as_tibble(D_asv, rownames = "ASV_ID")
+
+# Select individuals with > 5000 reads only
+D_asv <- D_asv %>% select(ASV_ID, names(D_asv[, -1])[which(colSums(D_asv[, -1]) > 5000)])
+
+# Read taxonomy data
+taxonomy <- read.table(file = "taxonomy.tsv", sep = "\t", header = T ,row.names = 1)
+
+#####
+# Clean the taxonomy, Silva/Greengenes format
+tax <- taxonomy %>%
+  select(Taxon) %>% 
+  separate(Taxon, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), "; ")
+
+tax.clean <- data.frame(row.names = row.names(tax),
+                        Kingdom = str_replace(tax[,1], "k__",""),
+                        Phylum = str_replace(tax[,2], "p__",""),
+                        Class = str_replace(tax[,3], "c__",""),
+                        Order = str_replace(tax[,4], "o__",""),
+                        Family = str_replace(tax[,5], "f__",""),
+                        Genus = str_replace(tax[,6], "g__",""),
+                        Species = str_replace(tax[,7], "s__",""),
+                        stringsAsFactors = FALSE)
+tax.clean[is.na(tax.clean)] <- ""
+tax.clean[tax.clean=="__"] <- ""
+
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,7] != ""){
+    tax.clean$Species[i] <- paste(tax.clean$Genus[i], tax.clean$Species[i], sep = " ")
+  } else if (tax.clean[i,2] == ""){
+    kingdom <- paste("Unclassified", tax.clean[i,1], sep = " ")
+    tax.clean[i, 2:7] <- kingdom
+  } else if (tax.clean[i,3] == ""){
+    phylum <- paste("Unclassified", tax.clean[i,2], sep = " ")
+    tax.clean[i, 3:7] <- phylum
+  } else if (tax.clean[i,4] == ""){
+    class <- paste("Unclassified", tax.clean[i,3], sep = " ")
+    tax.clean[i, 4:7] <- class
+  } else if (tax.clean[i,5] == ""){
+    order <- paste("Unclassified", tax.clean[i,4], sep = " ")
+    tax.clean[i, 5:7] <- order
+  } else if (tax.clean[i,6] == ""){
+    family <- paste("Unclassified", tax.clean[i,5], sep = " ")
+    tax.clean[i, 6:7] <- family
+  } else if (tax.clean[i,7] == ""){
+    tax.clean$Species[i] <- paste("Unclassified ",tax.clean$Genus[i], sep = " ")
+  }
+}
+
+# Clean taxonomy to ASV classified as bacteria only and in ASV data file
+tax.clean <- tax.clean[which(tax.clean$Kingdom=="d__Bacteria"),]
+tax.clean <- tax.clean[rownames(tax.clean) %in% D_asv$ASV_ID,]
+
+# Phyla not no consider in revised taxonomy (unclassified or small number of reads)
+phyla_others <- c("Unclassified d__Bacteria", "FCPU426", "WPS-2", "SAR324_clade(Marine_group_B)", "WPS-2",
+  "Acidobacteriota", "Bdellovibrionota", "Deinococcota", "Fusobacteriota", "Gemmatimonadota", "Synergistota", "Patescibacteria", "Chloroflexi")
+
+tax.clean$Phylum_rev <- ifelse(is.na(match(tax.clean$Phylum, phyla_others)), tax.clean$Phylum, "others")
+tax.clean$ASV_ID <- rownames(tax.clean)
+
+#######
+# Revise and classify identifiable families based on NCBI with {taxsize}
+family_names <- unique(tax.clean$Family)
+
+check_family_names <- sapply(family_names, function(name) {
+  tryCatch({
+    res <- taxize::classification(name, db = "ncbi")
+    any(sapply(res, function(x) "family" %in% x$rank))
+  }, error = function(e) FALSE)
+})
+names(check_family_names) <- family_names
+check_family_names[which(names(check_family_names)=="PB19")] <- FALSE    # manually replace "PB19" that escaped check
+
+family_names_valid <- family_names[which(check_family_names==TRUE)]
+family_others <-  family_names[which(check_family_names==FALSE)]
+                           
+tax.clean$Family_rev <- ifelse(is.na(match(tax.clean$Family, family_others)), tax.clean$Family, "others")
+# Number if identifiable families in dataset
+n_family <- length(unique(family_names_valid))
+
+genus_names <- unique(tax.clean$Genus)
+check_genus_names <- sapply(genus_names, function(name) {
+  tryCatch({
+    res <- taxize::classification(name, db = "ncbi")
+    any(sapply(res, function(x) "genus" %in% x$rank))
+  }, error = function(e) FALSE)
+})
+names(check_genus_names) <- genus_names
+check_genus_names[which(names(check_genus_names)=="PB19")] <- FALSE    # manually replace "PB19" that escaped check
+
+genus_names_valid <- genus_names[which(check_genus_names==TRUE)]
+genus_others <-  genus_names[which(check_genus_names==FALSE)]
+tax.clean$Genus_rev <- ifelse(is.na(match(tax.clean$Genus, genus_others)), tax.clean$Genus, "others")
+# Number if identifiable genera in dataset
+n_genus <- length(unique(genus_names_valid))
+
+# Clean ASV data to only include those with selected taxonomy
+D_asv <- D_asv %>% filter(ASV_ID %in% rownames(tax.clean))
+
+# Long table of ASV data
+D_asv_long <- as_tibble(D_asv) %>% pivot_longer(!ASV_ID, names_to = "SampleID", values_to = "n_reads")
+# Transpose the data
+Dt_asv <- as_tibble(t(D_asv[,-1]))	
+
+
+# Matrix of ASV data
+asv_mat <- as.matrix(D_asv[, -1])
+rownames(asv_mat) <- D_asv$ASV_ID
+
+# Df of ASV data
+asv_df <- data.frame(asv_mat)
+rownames(asv_df) <- rownames(asv_mat)
+
+d.asv_sampleID <- names(D_asv[,-1])
+
+# Read metadata from file
+setwd(dir.data)
+metadata <- read_csv("metadata_241107.csv")
+
+# Add variable 'group' to metadata
+metadata <- metadata %>% mutate(group = paste0(pasture_type, "_", month))
+
+# Add scaled variable for focal egg count and replace NA with 0
+metadata$Strongyle <- as.numeric(scale(metadata$str_raw_egg))
+metadata$Strongyle <- ifelse(is.na(metadata$Strongyle), 0, metadata$Strongyle)
+metadata$Nematodirus <- as.numeric(scale(metadata$nem_raw_egg))
+metadata$Nematodirus <- ifelse(is.na(metadata$Nematodirus), 0, metadata$Nematodirus)
+metadata$AllEPG.sc <- as.numeric(scale(metadata$all_epg))
+metadata$AllEPG.sc <- ifelse(is.na(metadata$AllEPG.sc), 0, metadata$AllEPG.sc)
+
+# Matched metadata to order in ASV data
+metadataMatch <- metadata[match(d.asv_sampleID, metadata$SampleID), ]
+metadataMatch <- metadataMatch %>%
+      mutate(pasture_type = fct_relevel(pasture_type, c("Ryegrass", "Mixed sward"))) %>%
+      mutate(month = fct_relevel(month, c("July", "Aug", "Sept")))
+
+# Df of metadata
+metadata_df <- data.frame(metadataMatch)
+rownames(metadata_df) <- metadata_df$SampleID
+metadata_df$pasture_type <- as.factor(metadata_df$pasture_type)
+metadata_df <- within(metadata_df, pasture_type <- relevel(pasture_type, ref = "Ryegrass"))
+metadata_df$month <- as.factor(metadata_df$month)
+metadata_df <- within(metadata_df, month <- relevel(month, ref = "Aug"))
+
+phylo_tree = read_tree("tree.nwk")
+phylo_tree <- ape::drop.tip(phylo_tree, which(is.na(match(phylo_tree$tip.label, rownames(asv_df))))) 
+
+
+#####
+# Some general patterns in ASV
+summary_asv <- D_asv_long %>%
+  group_by(ASV_ID) %>%
+  summarise(nread_total = sum(n_reads),
+            nhost_all = length(which(n_reads>0)),
+            .groups = 'drop')
+
+summary_sample <- D_asv_long %>%
+  group_by(SampleID) %>%
+  summarise(nread_total = sum(n_reads),
+            n_asv = length(which(n_reads>0)),
+            .groups = 'drop')
+summary_sample
+
+
+# Number of observed ASVs in each sample
+d.asv_NObs.asv <- colSums(ifelse(D_asv[,-1]>0,1,0))
+ 
+min(d.asv_NObs.asv); mean(d.asv_NObs.asv); sd(d.asv_NObs.asv); sd(d.asv_NObs.asv)/sqrt(length(d.asv_NObs.asv))
+
+###########
+# Composition ASV data and composition plot
+
+# Composition data at ASV-level
+D_asv_comp <- D_asv_long 
+D_asv_comp <- left_join(D_asv_comp, summary_sample, by="SampleID", relationship = "many-to-many")
+D_asv_comp <- D_asv_comp %>% mutate(readsProp = n_reads/nread_total)
+metadata2D_asv_comp <- metadataMatch %>% dplyr::select(SampleID, pasture_type, plot_ID, month, lamb_ID, Strongyle, Nematodirus )
+D_asv_comp <- left_join(D_asv_comp, metadata2D_asv_comp , by="SampleID", relationship = "many-to-many")
+
+# Composition data at phylum-level
+tax2comp <- as_tibble(tax.clean)
+tax2comp$ASV_ID <- rownames(tax.clean)
+tax2comp <- tax2comp %>% dplyr::select(ASV_ID, Phylum = Phylum_rev) 
+
+metadata2comp <- metadataMatch %>% dplyr::select(SampleID, pasture_type, month)
+
+summary_sample2 <- D_asv_long %>%
+  group_by(SampleID) %>%
+  summarise(nread_total = sum(n_reads),
+            .groups = 'drop')
+summary_sample2
+
+D_phyl_comp <- D_asv_long 
+D_phyl_comp <- left_join(D_phyl_comp, tax2comp, by="ASV_ID", relationship = "many-to-many") %>%
+  dplyr::select(SampleID, Phylum, n_reads) %>%
+  group_by(Phylum, SampleID) %>%
+  summarise(reads = sum(n_reads), .groups = 'drop') %>%
+  ungroup() 
+D_phyl_comp <- left_join(D_phyl_comp, summary_sample2, by="SampleID", relationship = "many-to-many")
+D_phyl_comp <- D_phyl_comp %>% mutate(readsProp = reads/nread_total)
+D_phyl_comp <- left_join(D_phyl_comp, metadata2comp , by="SampleID", relationship = "many-to-many")
+
+
+col_phyl  <- c(
+  "skyblue2", "#FB9A99", "palegreen2",  "#CAB2D6", "#FDBF6F", "#cb181d",  "khaki2", "#2171b5", "maroon", "#74c476",
+  "#8c6bb1", "#FF7F00",  "gray20", "gold1", "gray85")
+pie(rep(1, 15), col = col_phyl)
+col_plttype <- c(hcl.colors(5, "Terrain", alpha=0.99))[c(1,3)]
+strip_plttpye <- ggh4x::strip_themed(background_x = elem_list_rect(fill = col_plttype, alpha=0.55))
+
+plot_composition_phyl <-
+  D_phyl_comp %>%
+  mutate(Phylum = fct_relevel(Phylum, c("Actinobacteriota","Bacteroidota","Campilobacterota","Cyanobacteria","Deferribacterota","Desulfobacterota", 
+                                        "Elusimicrobiota","Fibrobacterota","Firmicutes","Myxococcota","Planctomycetota","Proteobacteria",
+                                        "Spirochaetota","Verrucomicrobiota","others"))) %>%
+    ggplot( aes(fill=Phylum, y=readsProp, x=SampleID)) + 
+  geom_bar(position="stack", stat="identity") +
+#  facet_grid(~ pasture_type + month, scales = "free") +
+  facet_nested(~ pasture_type + month, nest_line = element_line(linetype = 2), scales = "free") +
+      xlab("GM Samples") + 
+  ylab("Relative abundance (%)") + 
+ scale_fill_manual("Phylum",values=col_phyl ) +	
+  theme(panel.background = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank(), 
+        axis.text.y = element_text(size = 6), axis.title.x = element_text(size = 6), 
+        axis.title.y = element_text(size = 6), strip.text.x = element_text(size = 6),
+        legend.title = element_text(size = 5), legend.text = element_text(size = 5),
+        legend.key.size = unit(0.25, "cm"), legend.key.width = unit(0.25,"cm"),
+        strip.background = element_rect(fill="gray80"))
+plot_composition_phyl
+
+## ggsave(file="plot_composition_phyl.tiff", plot_composition_phyl, units = "in", dpi=300, width = 3.35*1.5, height = 3.35/1.5)
+
+# Summary of compositional data
+summary_comPhylum <- D_phyl_comp %>%
+  group_by(Phylum) %>%
+  summarise(prop_mean = round(mean(readsProp),2),
+            prop_min = round(min(readsProp),2),
+            prop_max = round(max(readsProp),2),
+                        .groups = 'drop')
+summary_comPhylum
+
+# Check for large Proteobacteria proportions
+D_phyl_comp %>% filter(Phylum=="Proteobacteria") %>% select(readsProp) %>% arrange(., desc(readsProp))
+# Same individual?
+D_phyl_comp %>% filter(Phylum=="Proteobacteria" & readsProp>0.10)
+
+# Data data of ASV aggregated at family level
+tax2Dfam <- as_tibble(tax.clean)
+tax2Dfam$ASV_ID <- rownames(tax.clean)
+tax2Dfam <- tax2Dfam %>% dplyr::select(ASV_ID, Family =Family_rev) 
+
+D_family <- D_asv_long 
+D_family <- left_join(D_family, tax2Dfam, by="ASV_ID", relationship = "many-to-many") %>%
+  dplyr::select(Family, SampleID, n_reads) %>%
+  group_by(Family, SampleID) %>%
+  summarise(n_reads = sum(n_reads), .groups = 'drop') %>%
+  ungroup() 
+D_family <- D_family %>% pivot_wider(names_from = SampleID, values_from = n_reads)
+
+# Matrix of family-level data
+family_mat <- as.matrix(D_family[, -1])
+rownames(family_mat) <- D_family$Family
+
+# The (three) most abundant identifiable families
+D_family$Family[rev(order(rowSums(D_family[,-1])))[1:10]]
+n_family <- length(unique(D_family$Family)) -1
+
+
+# Compostional data at family level
+D_family_comp <- D_asv_long 
+D_family_comp <- left_join(D_family_comp, tax2Dfam, by="ASV_ID", relationship = "many-to-many") %>%
+  dplyr::select(SampleID, Family, n_reads) %>%
+  group_by(Family, SampleID) %>%
+  summarise(reads = sum(n_reads), .groups = 'drop') %>%
+  ungroup() 
+D_family_comp <- left_join(D_family_comp, summary_sample2, by="SampleID", relationship = "many-to-many")
+D_family_comp <- D_family_comp %>% mutate(readsProp = reads/nread_total)
+D_family_comp <- left_join(D_family_comp, metadata2comp , by="SampleID", relationship = "many-to-many")
+# numeric label for families
+D_family_comp$FamilyID <- D_family_comp$Family
+D_family_comp$FamilyID[which(D_family_comp$Family=="others")] <- "zz"
+D_family_comp$FamilyID <-  paste0("F.", (as.numeric(factor(D_family_comp$FamilyID))))
+D_family_comp$FamilyID[which(D_family_comp$Family=="others")] <- "others"
+D_family_comp$FamilyID <- factor(D_family_comp$FamilyID, levels = unique(D_family_comp$FamilyID))
+
+# Compositional plot at family level
+col_family <- c(qualitative_hcl(n = n_family, palette = "Dynamic", l = 60, c = 90), "gray85")
+
+plot_composition_family <-
+  D_family_comp %>%
+  ggplot( aes(fill=FamilyID, y=readsProp, x=SampleID)) + 
+  geom_bar(position="stack", stat="identity") +
+  #  facet_grid(~ pasture_type + month, scales = "free") +
+  facet_nested(~ pasture_type + month, nest_line = element_line(linetype = 2), scales = "free") +
+  xlab("GM Samples") + 
+  ylab("Relative abundance (%)") + 
+  scale_fill_manual("Family",values= col_family) +	
+  theme(panel.background = element_blank(), axis.text.x = element_blank(), axis.ticks.x=element_blank(), 
+        axis.text.y = element_text(size = 6), axis.title.x = element_text(size = 6), 
+        axis.title.y = element_text(size = 6), strip.text.x = element_text(size = 6),
+        legend.title = element_text(size = 5), legend.text = element_text(size = 5),
+        legend.key.size = unit(0.25, "cm"), legend.key.width = unit(0.25,"cm"), legend.position = "bottom",
+        strip.background = element_rect(fill="gray80")) +
+  guides(fill = guide_legend(nrow = 8, byrow = TRUE))
+plot_composition_family
+
+##  ggsave(file="plot_composition_family.tiff", plot_composition_family, units = "in", dpi=300, width = 3.35*2.5, height = 3.35*1.5)
+
+
+# Data of ASV aggregated at Genus level
+tax2Dgenus <- as_tibble(tax.clean)
+tax2Dgenus$ASV_ID <- rownames(tax.clean)
+tax2Dgenus <- tax2Dgenus %>% dplyr::select(ASV_ID, Genus = Genus_rev) 
+
+D_genus <- D_asv_long 
+D_genus <- left_join(D_genus, tax2Dgenus, by="ASV_ID", relationship = "many-to-many") %>%
+  dplyr::select(Genus, SampleID, n_reads) %>%
+  group_by(Genus, SampleID) %>%
+  summarise(n_reads = sum(n_reads), .groups = 'drop') %>%
+  ungroup() 
+D_genus <- D_genus %>% pivot_wider(names_from = SampleID, values_from = n_reads)
+
+# Matrix of genus-level data
+genus_mat <- as.matrix(D_genus[, -1])
+rownames(genus_mat) <- D_genus$Genus
+
+# The (three) most abundant identifiable genera
+D_genus$Genus[rev(order(rowSums(D_genus[,-1])))[1:10]]
+
+
+# The (three) most abundant identifiable genera
+D_GenusTotal <- D_genus_comp %>% 
+  dplyr::select(Genus, reads) %>%
+  group_by(Genus) %>%
+  summarise(readsTotal = sum(reads), .groups = 'drop') %>%
+  ungroup() %>%
+  arrange(desc(readsTotal)) %>%
+  mutate(Total = sum(readsTotal),
+         readsProp = round(readsTotal/Total, 3),
+         Rank = row_number())
+
+plot_GenusRankAbund <- ggplot(D_GenusTotal, aes(x = Rank, y = readsProp)) +
+  geom_point(color = "steelblue", size = 4) + 
+  geom_line(color = "darkred") +  # Connect the points with a line
+  scale_x_continuous(trans = "log10") +  # Optional: Log scale for better visualization
+  scale_y_continuous(trans = "log10") +  # Optional: Log scale for better visualization
+  labs(x = "Rank (log-scale)", y = "Relative Abundance (log-scale)") +
+  coord_fixed(ratio = 1) +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 18)
+  ) +
+  geom_text(data = D_GenusTotal %>% filter(Rank <= 7), 
+            aes(label = Genus), 
+            angle = 90, vjust = 0.1, hjust = 1.2, color = "black", size = 5)
+
+##  ggsave(file="plot_GenusRankAbund.tiff", plot_GenusRankAbund, units = "in", dpi=300, width = 3.35*2, height = 3.35*2)
