@@ -1,0 +1,286 @@
+# Load libraries
+library(tidyverse)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(vegan)
+library(ggsci)
+
+
+###############
+#   Random subsampling and Alpha diversity estimates
+###############
+
+# Minimum number of reads/ number of subsamples to draw
+Nrarefy <- min(rowSums(Dt_asv))
+
+# number of samples for rarification
+nsamp <- 100
+# number of random draws from estimates
+ndraw <- 100
+
+####
+# Compute alpha diversity metrics from random subsamples
+
+Chao1_samp <- array(NA, dim = c(nrow(Dt_asv), nsamp*ndraw))
+Shannon_samp <- array(NA, dim = c(nrow(Dt_asv), nsamp))
+
+for (i in 1:nsamp) {
+  # Generate table of ASV subsample
+  asv_subs <- array(0, dim = dim(Dt_asv))
+  for (x in 1:nrow(Dt_asv)) {
+    prob <- Dt_asv[x, ]
+    if (sum(prob) > 0) {
+      prob <- prob / sum(prob)
+      draw <- sample(1:ncol(asv_subs), Nrarefy, rep = TRUE, prob = prob)
+      val_new <- table(draw)
+      pos_val <- as.numeric(names(val_new))
+      asv_subs[x, pos_val] <- val_new
+ 
+	samp.pos1 <- 1 + (i-1)*ndraw
+	samp.pos2 <- i*ndraw
+
+	chao1_est <- estimateR(asv_subs[x, ])[2] # "chao1"
+	chao1_sd <- estimateR(asv_subs[x, ])[3] # "chao1.se"
+	Chao1_samp[x, samp.pos1:samp.pos2] <- rnorm(ndraw, chao1_est, chao1_sd)
+
+	shannon_est <- diversity(asv_subs[x, ], index = "shannon", base = exp(1)) # "shannon"
+	Shannon_samp[x, i] <- shannon_est
+    } else {}
+  }
+  print(paste("Iteration:", i))
+}
+
+## Save/load the sampled estimated
+##  save(Chao1_samp.RData, file = "Chao1_samp.RData"); save(Shannon_samp.RData, file = "Shannon_samp.RData")
+##  load("Chao1_samp.RData"); load("Shannon_samp.RData")
+
+# Table of summary stats
+Chao1_stats <- array(NA, dim = c(nrow(Dt_asv), 4))
+colnames(Chao1_stats) <- c("Mean", "Median", "CI95_Upper", "CI5_Lower")
+for (x in 1:nrow(Dt_asv)) {
+	Chao1_stats[x, "Mean"] <- mean(Chao1_samp[x, ], na.rm = TRUE)
+	Chao1_stats[x, "Median"] <- median(Chao1_samp[x, ], na.rm = TRUE)
+	Chao1_stats[x, "CI95_Upper"] <- quantile(Chao1_samp[x, ], probs = 0.975, na.rm = TRUE)
+	Chao1_stats[x, "CI5_Lower"] <- quantile(Chao1_samp[x, ], probs = 0.025, na.rm = TRUE)
+}
+Chao1_stats <- as_tibble(Chao1_stats) %>%
+		mutate(SampleID = d.asv_sampleID)
+Chao1_stats  <- left_join(Chao1_stats , metadataMatch, by="SampleID", keep =TRUE)		
+Chao1_stats  <- Chao1_stats  %>% mutate(group = paste0(pasture_type, "_", month)) %>%
+		   mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+		   mutate(pasture_type = fct_relevel(pasture_type, c('Ryegrass', 'Mixed sward')))
+Chao1_stats$NObs.asv <-  d.asv_NObs.asv
+
+
+Shannon_stats <- array(NA, dim = c(nrow(Dt_asv), 3))
+colnames(Shannon_stats) <- c("Mean", "CI95_Upper", "CI5_Lower")
+for (x in 1:nrow(Dt_asv)) {
+	Shannon_stats[x, "Mean"] <- mean(Shannon_samp[x, ], na.rm = TRUE)
+	Shannon_stats[x, "CI95_Upper"] <- quantile(Shannon_samp[x, ], probs = 0.975, na.rm = TRUE)
+	Shannon_stats[x, "CI5_Lower"] <- quantile(Shannon_samp[x, ], probs = 0.025, na.rm = TRUE)
+}
+Shannon_stats <- as_tibble(Shannon_stats) %>%
+		mutate(SampleID = d.asv_sampleID)
+Shannon_stats  <- left_join(Shannon_stats , metadataMatch, by="SampleID", keep =TRUE)		
+Shannon_stats  <- Shannon_stats  %>% mutate(group = paste0(pasture_type, "_", month)) %>%
+		   mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+		   mutate(pasture_type = fct_relevel(pasture_type, c('Ryegrass', 'Mixed sward'))) 
+Shannon_stats$NObs.asv <-  d.asv_NObs.asv
+
+# Plot estimates
+col_month <- c(hcl.colors(3, "Viridis", alpha=0.99))
+pos.jitter = position_jitter(width = 0.1, seed=1)
+plot_Chao1 <- 
+   Chao1_stats %>%
+   mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+   mutate(group = fct_relevel(group, c('permanent_July', 'permanent_Aug', 'permanent_Sept', 'herbal ley_July', 'herbal ley_Aug', 'herbal ley_Sept'))) %>%
+ ggplot(aes(y = Mean, x = group, fill=month)) + 
+ geom_violin(alpha=0.3) +
+ geom_point(aes(y = NObs.asv, x = group), position=pos.jitter, size=3, pch=17, col='darkgrey', alpha=0.5) +
+ geom_point(position=pos.jitter, size=3, pch=19) +
+ geom_errorbar(aes(ymin=CI5_Lower, ymax=CI95_Upper), position=pos.jitter, color='black', width=0.01, linewidth=0.4) +
+ scale_fill_manual(values=col_month) +
+   labs(x = "Pasture type", y = "Chao1 species richness") + theme_bw() +
+   theme(axis.text.x = element_text(size = 14), axis.text.y = element_text(size = 14), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) 
+plot_Chao1
+
+plot_Shannon <- 
+  Shannon_stats %>%
+  mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+  mutate(group = fct_relevel(group, c('permanent_July', 'permanent_Aug', 'permanent_Sept', 'ryegrass.mix_Juryegrass.mixly', 'ryegrass.mix_Aug', 'ryegrass.mix_Sept'))) %>%
+  ggplot(aes(y = Mean, x = group, fill=month)) + 
+  geom_violin(alpha=0.3) +
+  geom_point(position=pos.jitter, size=3, pch=19) +
+  geom_errorbar(aes(ymin=CI5_Lower, ymax=CI95_Upper), position=pos.jitter, color='black', width=0.01, linewidth=0.4) +
+  scale_fill_manual(values=col_month) +
+  labs(x = "Pasture type", y = "Shannon diversity") + theme_bw() +
+  theme(axis.text.x = element_text(size = 14), axis.text.y = element_text(size = 14), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) 
+plot_Shannon
+
+library(ggh4x)
+library(ggpubr)
+
+strip_plttpye <- ggh4x::strip_themed(background_x = elem_list_rect(fill = col_plttype, alpha=0.55))
+
+plot_Chao1_strip <- 
+   Chao1_stats %>%
+   mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+   mutate(pasture_type = fct_relevel(pasture_type, c('Ryegrass', 'Mixed sward'))) %>%
+ ggplot(aes(y = Mean, x = month, fill=month)) + 
+ geom_violin(alpha=0.3) +
+ geom_point(aes(y = NObs.asv, x = month), position=pos.jitter, size=0.5, pch=17, col='darkgrey', alpha=0.5) +
+ geom_point(position=pos.jitter, size=0.5, pch=19) +
+ geom_errorbar(aes(ymin=CI5_Lower, ymax=CI95_Upper), position=pos.jitter, color='black', width=0.01, linewidth=0.4) +
+  facet_wrap2(~ factor(pasture_type, levels=c('Ryegrass', 'Mixed sward')), strip = strip_plttpye) + 
+  scale_fill_manual(values=col_month) +
+   labs(x = "Sample", y = "Chao1 species richness") + theme_bw() +
+  theme(aspect.ratio = 1, axis.text.x = element_text(size = 5.5), axis.text.y = element_text(size = 7), 
+        axis.title.x = element_text(size = 7), axis.title.y = element_text(size = 7), 
+        strip.text = element_text(size = 6), legend.position="none") 
+plot_Chao1_strip
+
+plot_Shannon_strip <- 
+   Shannon_stats %>%
+   mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+   mutate(pasture_type = fct_relevel(pasture_type, c('Ryegrass', 'Mixed sward'))) %>%
+ ggplot(aes(y = Mean, x = month, fill=month)) + 
+ geom_violin(alpha=0.3) +
+ geom_point(position=pos.jitter, size=0.5, pch=19) +
+ geom_errorbar(aes(ymin=CI5_Lower, ymax=CI95_Upper), position=pos.jitter, color='black', width=0.01, linewidth=0.4) +
+  facet_wrap2(~ factor(pasture_type, levels=c('Ryegrass', 'Mixed sward')), strip = strip_plttpye) + 
+  scale_fill_manual(values=col_month) +
+   labs(x = "Sample", y = "Shannon diversity") + theme_bw() +
+   theme(aspect.ratio = 1, axis.text.x = element_text(size = 5.5), axis.text.y = element_text(size = 7), 
+        axis.title.x = element_text(size = 7), axis.title.y = element_text(size = 7), 
+        strip.text = element_text(size = 6), legend.position="none") 
+plot_Shannon_strip
+
+plot_AlphaDiversity_strip <- ggpubr::ggarrange(plot_Chao1_strip, plot_Shannon_strip)
+
+## ggsave(file="plot_AlphaDiversity_strip.tiff", plot_AlphaDiversity_strip, units = "in", dpi=300, width = 2*3.35, height = 3.35)
+
+
+#############
+# Explore variation in per-capita alpha-diversity in GLMM using glmmTMB
+
+library(glmmTMB)
+library(multcomp)
+library(MuMIn)
+
+# Fit GLMM for Chao1 indices with and without interaction effects
+fit_glmm_Chao1_int <- glmmTMB(Mean ~  -1 +  month * pasture_type + Strongyle + Nematodirus + (1|plot_ID), data=Chao1_stats, family=gaussian)
+fit_glmm_Chao1 <- glmmTMB(Mean ~   -1 + month + pasture_type + Strongyle + Nematodirus + (1|plot_ID), data=Chao1_stats, family=gaussian)
+
+# Compare models
+anova(fit_glmm_Chao1_int, fit_glmm_Chao1)
+summary(fit_glmm_Chao1_int)$AIC; summary(fit_glmm_Chao1)$AIC; 
+
+# Choose model without interaction effect
+summary(fit_glmm_Chao1)
+# Check for variance explained by predictors
+r.squaredGLMM(fit_glmm_Chao1)
+
+posthoc_glmm_Chao1_mnth <- multcomp::glht(fit_glmm_Chao1 , linfct = mcp(month = 'Tukey'))
+summary(posthoc_glmm_Chao1_mnth)
+
+posthoc_glmm_Chao1_pasture <- multcomp::glht(fit_glmm_Chao1, linfct = mcp(pasture_type = 'Tukey'))
+summary(posthoc_glmm_Chao1_pasture)
+
+# Random effects
+ranef(fit_glmm_Chao1)
+
+# Variance components
+VarCorr(fit_glmm_Chao1)[[c("cond","plot_ID")]]
+
+# Variance explained by random effect of lamb_ID
+VarCorr(fit_glmm_Chao1)[[c("cond","plot_ID")]][1] /var(log(Chao1_stats$Mean))
+
+
+# Fit GLMM for Shannon indices with and without interaction effects
+fit_glmm_Shannon_int <- glmmTMB(Mean ~   -1  + month * pasture_type + Strongyle + Nematodirus + (1|plot_ID), data=Shannon_stats, family=gaussian)
+fit_glmm_Shannon <- glmmTMB(Mean ~   -1 +month + pasture_type + Strongyle + Nematodirus + (1|plot_ID), data=Shannon_stats, family=gaussian)
+
+
+# Compare models
+anova(fit_glmm_Shannon_int, fit_glmm_Shannon)
+summary(fit_glmm_Shannon_int)$AIC; summary(fit_glmm_Shannon)$AIC
+
+# Choose model without interaction effect
+summary(fit_glmm_Shannon)
+# Check for variance explained by predictors
+r.squaredGLMM(fit_glmm_Shannon)
+
+posthoc_glmm_Shannon_mnth <- multcomp::glht(fit_glmm_Shannon, linfct = mcp(month = 'Tukey'))
+summary(posthoc_glmm_Shannon_mnth)
+
+posthoc_glmm_Shannon_pasture <- multcomp::glht(fit_glmm_Shannon, linfct = mcp(pasture_type = 'Tukey'))
+summary(posthoc_glmm_Shannon_pasture)
+
+# Variance explained by random effect of lamb_ID
+VarCorr(fit_glmm_Shannon)[[c("cond","lamb_ID")]][1] /var(log(Shannon_stats$Mean))
+
+
+#######################
+# Analysis of variation parasite egg counts
+
+length(which(metadata_df$str_raw_egg>0)) /  length(which(!is.na(metadata_df$str_raw_egg)))
+length(which(metadata_df$nem_raw_egg>0)) / length(which(!is.na(metadata_df$nem_raw_egg)))
+length(which(metadata_df$nem_raw_egg==0 & metadata_df$str_raw_egg==0))
+
+# log transform egg counts for analysis (log-transformation because of some very large values in egg counts)
+metadata_df$logNematodirus <- log(metadata_df$nem_raw_egg+00001)
+metadata_df$logStronglyes <- log(metadata_df$str_raw_egg+00001)
+
+
+#####
+# Fit glmmTMB with and without interaction effects
+fit_glmm_nem_raw_egg <- glmmTMB(nem_raw_egg ~   -1 + month + pasture_type + (1|plot_ID), data=metadata_df, family=nbinom1)
+fit_glmm_nem_raw_egg_int <- glmmTMB(nem_raw_egg ~   -1 + month * pasture_type + (1|plot_ID), data=metadata_df, family=nbinom1)
+fit_glmm_Nematodirus.log_int <- glmmTMB(logNematodirus ~   -1 + month * pasture_type + (1|plot_ID), data=metadata_df, family=gaussian)
+fit_glmm_Nematodirus.log <- glmmTMB(logNematodirus ~   -1 + month + pasture_type + (1|plot_ID), data=metadata_df, family=gaussian)
+
+summary(fit_glmm_nem_raw_egg)$AIC; summary(fit_glmm_nem_raw_egg_int)$AIC; summary(fit_glmm_Nematodirus.log_int)$AIC; summary(fit_glmm_Nematodirus.log)$AIC
+
+# Check for variance explained by predictors
+r.squaredGLMM(fit_glmm_Nematodirus.log)
+
+# Posthoc test for month and pasture as predictors
+posthoc_nematodirus_mnth <- multcomp::glht(fit_glmm_Nematodirus.log, linfct = mcp(month = 'Tukey'))
+summary(posthoc_nematodirus_mnth)
+
+posthoc_nematodirus_pasture <- multcomp::glht(fit_glmm_Nematodirus.log, linfct = mcp(pasture_type = 'Tukey'))
+summary(posthoc_nematodirus_pasture)
+
+
+plot_fec.nematodirus <- 
+  as_tibble(metadata_df) %>%
+  mutate(month = fct_relevel(month, c('July', 'Aug', 'Sept'))) %>%
+  ggplot() + 
+  geom_violin(aes(y = logNematodirus, x = pasture_type), alpha=0.3) +
+ # geom_point(aes(y = logNematodirus, x = month), position=pos.jitter, size=3, pch=17, col='darkgrey', alpha=0.5) +
+  geom_point(aes(y = logNematodirus, x = pasture_type, col=month), position=pos.jitter, size=3, pch=19) +
+  scale_fill_manual(values=col_month) +
+  labs(x = "Pasture type", y = "Nematodirus, scaled egg count") + theme_bw() +
+  theme(axis.text.x = element_text(size = 14), axis.text.y = element_text(size = 14), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) 
+plot_fec.nematodirus
+
+
+fit_glmm_str_raw_egg <- glmmTMB(str_raw_egg ~   -1 + month + pasture_type + (1|plot_ID), data=metadata_df, family=nbinom1)
+fit_glmm_str_raw_egg_int <- glmmTMB(str_raw_egg ~   -1 + month * pasture_type + (1|plot_ID), data=metadata_df, family=nbinom1)
+fit_glmm_strongyle.log_int <- glmmTMB(logStronglyes ~   -1 + month * pasture_type + (1|plot_ID), data=metadata_df, family=gaussian)
+fit_glmm_strongyle.log <- glmmTMB(logStronglyes ~   -1 + month + pasture_type + (1|plot_ID), data=metadata_df, family=gaussian)
+
+
+summary(fit_glmm_str_raw_egg)$AIC; summary(fit_glmm_str_raw_egg_int)$AIC; summary(fit_glmm_strongyle.log_int)$AIC; summary(fit_glmm_strongyle.log )$AIC
+
+summary(fit_glmm_strongyle.log)
+
+posthoc_strongyle_mnth <- multcomp::glht(fit_glmm_strongyle.log, linfct = mcp(month = 'Tukey'))
+summary(posthoc_strongyle_mnth)
+
+posthoc_strongyle_pasture <- multcomp::glht(fit_glmm_strongyle.log, linfct = mcp(pasture_type = 'Tukey'))
+summary(posthoc_strongyle_pasture)
