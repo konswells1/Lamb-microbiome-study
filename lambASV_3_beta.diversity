@@ -1,0 +1,238 @@
+##################
+# Phyloseq beta div analysis
+#################
+
+library("phyloseq")
+library("microbiome")
+
+
+# Indicator of ASV observed in > 3 host individual and with >50 reads in total
+trshld_reads01 <- round(0.01 * min(colSums(asv_mat))) 
+
+select_ASV_filt01 <- rowSums(ifelse(asv_mat>0,1,0))>3 & rowSums(asv_mat)>trshld_reads01
+asv_mat_filt01 <- asv_mat[select_ASV_filt01,]
+
+dim(asv_mat); dim(asv_mat_filt01)
+
+select_genus_filt01 <- rowSums(ifelse(genus_mat>0,1,0))>3 & rowSums(genus_mat)>trshld_reads01
+genus_mat_filt01 <- genus_mat[select_genus_filt01,]
+
+select_family_filt01 <- rowSums(ifelse(family_mat>0,1,0))>3 & rowSums(family_mat)>trshld_reads01
+family_mat_filt01 <- family_mat[select_family_filt01,]
+
+# Generate phyloseq object
+OTU = otu_table(as.matrix(asv_mat_filt01), taxa_are_rows = TRUE)
+Tax = tax_table(as.matrix(tax.clean))
+Samples <- sample_data(metadata_df)
+# merge the data
+physeq_Data <- phyloseq(OTU, Tax, Samples, phylo_tree)
+
+# Rarified phyloseq data
+set.seed(1)
+ps.rarefied = rarefy_even_depth(physeq_Data, rngseed=1, sample.size=0.999*min(sample_sums(physeq_Data)), replace=F)
+
+# Centred log ratio (CLR) transformed abundances
+physeq_Data_clr <- microbiome::transform(physeq_Data, "clr")
+asv_mat_filt01_clr <- otu_table(physeq_Data_clr)
+
+# Distance matrices
+
+dist_bray_rarf <- phyloseq::distance(ps.rarefied, method="bray")
+dist_wunifrac_rarf <-  phyloseq::distance(ps.rarefied, method="wunifrac")  ##phyloseq::distance(phyloseq_Data, method="wunifrac")
+
+dist_bray_avg <- vegan::avgdist(as.matrix(t(asv_mat_filt01)), dmethod = "bray", sample=min(colSums(asv_mat_filt01)), iterations = 10)
+
+dist_clr <- vegan::vegdist(asv_mat_filt01_clr, method="euclidian")
+
+dist_bray_avg_genus <- vegan::avgdist(as.matrix(t(genus_mat_filt01)), dmethod = "bray", sample=min(colSums(genus_mat_filt01)), iterations = 10)
+dist_bray_avg_family <- vegan::avgdist(as.matrix(t(family_mat_filt01)), dmethod = "bray", sample=min(colSums(family_mat_filt01)), iterations = 10)
+
+
+range(dist_bray_avg); mean(dist_bray_avg); sd(dist_bray_avg);  sd(dist_bray_avg)/sqrt(length(dist_bray_avg))
+
+
+## PERMANOVA test using vegan::adonis2()
+adonis2_bray_avg  <- vegan::adonis2(dist_bray_avg ~ as.factor(month)* as.factor(pasture_type) + as.factor(lamb_ID) + Strongyle + Nematodirus, strata=metadataMatch$plot_ID, data = metadataMatch)
+adonis2_bray_avg
+
+
+vegan::adonis2(dist_bray_avg ~ as.factor(month)* as.factor(pasture_type) + Strongyle + Nematodirus + as.factor(lamb_ID), data = metadataMatch)
+
+# adonis2_bray_rarf  <- vegan::adonis2(dist_bray_rarf ~ as.factor(month)* as.factor(pasture_type) + Strongyle + Nematodirus, strata=metadataMatch$lamb_ID, data = metadataMatch)
+# adonis2_bray_rarf
+
+# adonis2_wunifrac_rarf  <- vegan::adonis2(dist_wunifrac_rarf ~ as.factor(month)*as.factor(pasture_type) + Strongyle + Nematodirus, data = metadataMatch)
+# adonis2_wunifrac_rarf
+
+
+## Beta dispersion analysis using vegan::betadisper
+betadisp_bray_pasture <- vegan::betadisper(dist_bray_avg, metadataMatch$pasture_type)
+anova(betadisp_bray_pasture)
+
+betadisp_bray_month <- vegan::betadisper(dist_bray_avg, metadataMatch$month)
+anova(betadisp_bray_month)
+
+betadisp_bray_month <- vegan::betadisper(dist_bray_avg, metadataMatch$lamb_ID)
+anova(betadisp_bray_month)
+
+betadisp_group_bray <- vegan::betadisper(dist_bray_avg, metadataMatch$group)
+anova(betadisp_group_bray)
+
+
+# NMDS
+# ordiplot(ordination_NMDS_bray,  main = "NMDS - Bray-Curtis")
+
+NMDS_bray <- vegan::metaMDS(dist_bray_avg)
+NMDS_wunifrac <- vegan::metaMDS(dist_wunifrac_rarf)
+
+
+nmds.metadata_bray <- scores(NMDS_bray) %>% as_tibble(rownames = "SampleID") %>%
+	inner_join(., metadataMatch, by="SampleID")
+
+nmds.centroid_bray <- nmds.metadata_bray %>%
+		group_by(pasture_type) %>%
+		summarize(NMDS1 =mean(NMDS1), NMDS2=mean(NMDS2))
+
+nmds.metadata_wunifrac <- scores(NMDS_wunifrac) %>% as_tibble(rownames = "SampleID") %>%
+	inner_join(., metadataMatch, by="SampleID")
+
+plot_NMDS_bray <-
+  nmds.metadata_bray %>%
+  mutate(month = fct_relevel(month, c("July", "Aug", "Sept"))) %>%
+  ggplot(aes(x=NMDS1, y=NMDS2, color=pasture_type)) +
+	geom_point(data=nmds.centroid_bray, size=3, shape="X", fill=  col_plttype, color=col_plttype, alpha =0.8,
+		aes(fill=pasture_type), show.legend=FALSE) +
+	geom_point(aes(shape=factor(month)), size=1.5) +
+	scale_colour_manual(values=col_plttype) +
+	stat_ellipse(level=0.95, show.legend=FALSE, linewidth = 0.5, linetype = 2, alpha =0.8) +
+      labs(color = "Sward type", shape="Month") + 
+  theme_bw() +
+  xlab("NMDS-1") + ylab("NMDS-2") +
+  theme(aspect.ratio = 1, axis.text.x = element_text(size = 7), axis.text.y = element_text(size = 7), 
+        axis.title.x = element_text(size = 7), axis.title.y = element_text(size = 7),
+        legend.title=element_text(size=7), legend.text=element_text(size=6))
+  ##theme(legend.position="bottom")
+  ##theme(legend.position=c(0.3,0.3))
+plot_NMDS_bray
+
+## setwd(dir.analysis); ggsave(file="plot_NMDS_bray_2.tiff", plot_NMDS_bray, units = "in", dpi=300, width = 3.35, height = 3.35/1.5)
+
+
+####################
+# NMDS with convex hulls
+# Generate convex hulls for individuals as grouping factor 
+hulls <- nmds.metadata_bray %>%
+  group_by(lamb_ID) %>%
+  filter(n() >= 3) %>%  # Convex hulls need at least 3 points
+  slice(chull(NMDS1, NMDS2))
+
+# Step 2: Generate plot
+plot_NMDS_indhulls <- data %>%
+  mutate(month = fct_relevel(month, c("July", "Aug", "Sept"))) %>%
+  ggplot(aes(x = NMDS1, y = NMDS2, color = pasture_type)) +
+  
+  # Convex hulls by lamb_ID
+  geom_polygon(data = hulls, aes(group = lamb_ID, fill = pasture_type),
+               alpha = 0.2, color = NA, show.legend = FALSE) +
+  
+  # Optional: Centroids (if using)
+  geom_point(data = nmds.centroid_bray, size = 3, shape = "X",
+             fill = col_plttype, color = col_plttype, alpha = 0.8,
+             aes(fill = pasture_type), show.legend = FALSE) +
+  
+  # NMDS points
+  geom_point(aes(shape = factor(month)), size = 1.5) +
+  stat_ellipse(level=0.95, show.legend=FALSE, linewidth = 0.5, linetype = 2, alpha =0.8) +
+  labs(color = "Sward type", shape="Month") +   
+  # Color and fill scales
+  scale_colour_manual(values = col_plttype) +
+  scale_fill_manual(values = col_plttype) +
+  
+  # Labels and theme
+  labs(color = "Sward type", shape = "Month") +
+  theme_bw() +
+  xlab("NMDS-1") +
+  ylab("NMDS-2") +
+  theme(
+    aspect.ratio = 1,
+    axis.text.x = element_text(size = 7),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6)
+  )
+
+plot_NMDS_indhulls
+
+## setwd(dir.analysis); ggsave(file="plot_NMDS_indhulls.tiff", plot_NMDS_indhulls, units = "in", dpi=300, width = 3.35, height = 3.35/1.5)
+
+
+#######
+## NMDS genus-level data
+
+
+NMDS_bray_genus <- vegan::metaMDS(dist_bray_avg_genus)
+NMDS_bray_family <- vegan::metaMDS(dist_bray_avg_family)
+
+nmds.metadata_bray_genus <- scores(NMDS_bray_genus) %>% as_tibble(rownames = "SampleID") %>%
+	inner_join(., metadataMatch, by="SampleID")
+
+nmds.centroid_brayy_genus <- nmds.metadata_bray_genus %>%
+		group_by(pasture_type) %>%
+		summarize(NMDS1 =mean(NMDS1), NMDS2=mean(NMDS2))
+
+plot_NMDS_bray_genus <-
+  nmds.metadata_bray_genus %>%
+  mutate(month = fct_relevel(month, c("July", "Aug", "Sept"))) %>%
+  ggplot(aes(x=NMDS1, y=NMDS2, color=pasture_type)) +
+	geom_point(data=nmds.centroid_bray, size=3, shape="X", fill=  col_plttype, color=col_plttype, alpha =0.8,
+		aes(fill=pasture_type), show.legend=FALSE) +
+	geom_point(aes(shape=factor(month)), size=1.5) +
+	scale_colour_manual(values=col_plttype) +
+	stat_ellipse(level=0.95, show.legend=FALSE, linewidth = 0.5, linetype = 2, alpha =0.8) +
+      labs(color = "Pasture type", shape="Month") + 
+  theme_bw() +
+  xlab("NMDS-1") + ylab("NMDS-2") +
+  ggtitle("Genus-level data") +
+  theme(axis.text.x = element_text(size = 7), axis.text.y = element_text(size = 7), 
+        axis.title.x = element_text(size = 7), axis.title.y = element_text(size = 7),
+        legend.title=element_text(size=7), legend.text=element_text(size=6))
+  ##theme(legend.position="bottom")
+  ##theme(legend.position=c(0.3,0.3))
+plot_NMDS_bray_genus
+
+## ggsave(file="plot_NMDS_bray_genus.tiff", plot_NMDS_bray_genus, units = "in", dpi=300, width = 3.35, height = 3.35/1.5)
+
+#######
+## NMDS family-level data
+
+
+NMDS_bray_family <- vegan::metaMDS(dist_bray_avg_family)
+
+nmds.metadata_bray_family <- scores(NMDS_bray_family) %>% as_tibble(rownames = "SampleID") %>%
+	inner_join(., metadataMatch, by="SampleID")
+
+nmds.centroid_brayy_family <- nmds.metadata_bray_family %>%
+		group_by(pasture_type) %>%
+		summarize(NMDS1 =mean(NMDS1), NMDS2=mean(NMDS2))
+
+plot_NMDS_bray_family <-
+  nmds.metadata_bray_family %>%
+  mutate(month = fct_relevel(month, c("July", "Aug", "Sept"))) %>%
+  ggplot(aes(x=NMDS1, y=NMDS2, color=pasture_type)) +
+	geom_point(data=nmds.centroid_bray, size=3, shape="X", fill=  col_plttype, color=col_plttype, alpha =0.8,
+		aes(fill=pasture_type), show.legend=FALSE) +
+	geom_point(aes(shape=factor(month)), size=1.5) +
+	scale_colour_manual(values=col_plttype) +
+	stat_ellipse(level=0.95, show.legend=FALSE, linewidth = 0.5, linetype = 2, alpha =0.8) +
+      labs(color = "Pasture type", shape="Month") + 
+  theme_bw() +
+  xlab("NMDS-1") + ylab("NMDS-2") +
+  ggtitle("Family-level data") +
+  theme(axis.text.x = element_text(size = 7), axis.text.y = element_text(size = 7), 
+        axis.title.x = element_text(size = 7), axis.title.y = element_text(size = 7),
+        legend.title=element_text(size=7), legend.text=element_text(size=6))
+  ##theme(legend.position="bottom")
+  ##theme(legend.position=c(0.3,0.3))
+plot_NMDS_bray_family
