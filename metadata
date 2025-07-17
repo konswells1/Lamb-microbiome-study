@@ -1,0 +1,19 @@
+Metadata associated with the study/analysis
+
+The data tabel contains the follwing columns/information:
+
+SampleID: Unique identifier for each faecal sample collected.
+
+pasture_type: Type of pasture where the sample was collected (ryegrass, mixed sward).
+
+plot_ID: Identifier for the specific experimental plot where the sample was taken.
+
+sample_date: Calendar date on which the faecal sample was collected (format: YYYY-MM-DD).
+
+lamb_ID: Unique identifier assigned to each lamb from which a sample was taken.
+
+sex: Biological sex of the lamb (male, female).
+
+FEC_Strongyles: Fecal Egg Count (eggs per gram) for Strongyle-type nematodes.
+
+FEC_Namatodirus: Fecal Egg Count (eggs per gram) for Nematodirus battus.
